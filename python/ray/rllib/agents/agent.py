@@ -331,7 +331,8 @@ class Agent(Trainable):
             self.env_creator = lambda env_config: None
 
         # Merge the supplied config with the class default
-        merged_config = self._default_config.copy()
+        # FIXME(ev) this is where the bug is, default_config for some reason is not default
+        merged_config = copy.deepcopy(self._default_config)
         merged_config = deep_update(merged_config, config,
                                     self._allow_unknown_configs,
                                     self._allow_unknown_subkeys)
