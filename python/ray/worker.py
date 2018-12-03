@@ -12,7 +12,6 @@ import logging
 import numpy as np
 import os
 import redis
-import setproctitle
 import signal
 import sys
 import threading
@@ -72,6 +71,15 @@ DEFAULT_ACTOR_CREATION_CPUS_SPECIFIED_CASE = 1
 # into the program using Ray. Ray configures it by default automatically
 # using logging.basicConfig in its entry/init points.
 logger = logging.getLogger(__name__)
+
+try:
+    import setproctitle
+except ImportError:
+    setproctitle = None
+    logger.warning(
+        "WARNING: Not updating worker name since `setproctitle` is not "
+        "installed. Install this with `pip install setproctitle` "
+        "(or ray[debug]) to enable monitoring of worker processes.")
 
 
 class RayTaskError(Exception):
@@ -713,7 +721,7 @@ class Worker(object):
                     "driver_id": self.task_driver_id.id(),
                     "function_id": function_to_run_id,
                     "function": pickled_function,
-                    "run_on_other_drivers": run_on_other_drivers
+                    "run_on_other_drivers": str(run_on_other_drivers)
                 })
             self.redis_client.rpush("Exports", key)
             # TODO(rkn): If the worker fails after it calls setnx and before it
@@ -1446,12 +1454,8 @@ def _init(address_info=None,
         # Use 1 local scheduler if num_local_schedulers is not provided. If
         # existing local schedulers are provided, use that count as
         # num_local_schedulers.
-        local_schedulers = address_info.get("local_scheduler_socket_names", [])
         if num_local_schedulers is None:
-            if len(local_schedulers) > 0:
-                num_local_schedulers = len(local_schedulers)
-            else:
-                num_local_schedulers = 1
+            num_local_schedulers = 1
         # Use 1 additional redis shard if num_redis_shards is not provided.
         num_redis_shards = 1 if num_redis_shards is None else num_redis_shards
 
@@ -1920,7 +1924,8 @@ def connect(info,
     # Initialize some fields.
     if mode is WORKER_MODE:
         worker.worker_id = random_string()
-        setproctitle.setproctitle("ray_worker")
+        if setproctitle:
+            setproctitle.setproctitle("ray_worker")
     else:
         # This is the code path of driver mode.
         if driver_id is None:
@@ -2013,13 +2018,13 @@ def connect(info,
             "driver_id": worker.worker_id,
             "start_time": time.time(),
             "plasma_store_socket": info["store_socket_name"],
-            "local_scheduler_socket": info.get("local_scheduler_socket_name"),
             "raylet_socket": info.get("raylet_socket_name")
         }
         driver_info["name"] = (main.__file__ if hasattr(main, "__file__") else
                                "INTERACTIVE MODE")
         worker.redis_client.hmset(b"Drivers:" + worker.worker_id, driver_info)
-        if not worker.redis_client.exists("webui"):
+        if (not worker.redis_client.exists("webui")
+                and info["webui_url"] is not None):
             worker.redis_client.hmset("webui", {"url": info["webui_url"]})
         is_worker = False
     elif mode == WORKER_MODE:
@@ -2027,7 +2032,6 @@ def connect(info,
         worker_dict = {
             "node_ip_address": worker.node_ip_address,
             "plasma_store_socket": info["store_socket_name"],
-            "local_scheduler_socket": info["local_scheduler_socket_name"]
         }
         if redirect_worker_output:
             worker_dict["stdout_file"] = os.path.abspath(log_stdout_file.name)
@@ -2041,7 +2045,7 @@ def connect(info,
     worker.plasma_client = thread_safe_client(
         plasma.connect(info["store_socket_name"], "", 64))
 
-    local_scheduler_socket = info["raylet_socket_name"]
+    raylet_socket = info["raylet_socket_name"]
 
     # If this is a driver, set the current task ID, the task driver ID, and set
     # the task index to 0.
@@ -2100,8 +2104,7 @@ def connect(info,
     worker.multithreading_warned = False
 
     worker.local_scheduler_client = ray.raylet.LocalSchedulerClient(
-        local_scheduler_socket, worker.worker_id, is_worker,
-        worker.current_task_id)
+        raylet_socket, worker.worker_id, is_worker, worker.current_task_id)
 
     # Start the import thread
     import_thread.ImportThread(worker, mode).start()
@@ -2169,9 +2172,11 @@ def disconnect(worker=global_worker):
 
 @contextmanager
 def _changeproctitle(title, next_title):
-    setproctitle.setproctitle(title)
+    if setproctitle:
+        setproctitle.setproctitle(title)
     yield
-    setproctitle.setproctitle(next_title)
+    if setproctitle:
+        setproctitle.setproctitle(next_title)
 
 
 def _try_to_compute_deterministic_class_id(cls, depth=5):

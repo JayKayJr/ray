@@ -64,7 +64,10 @@ else:
 
 optional_ray_files += ray_autoscaler_files
 
-extras = {"rllib": ["pyyaml", "gym[atari]", "opencv-python", "lz4", "scipy"]}
+extras = {
+    "rllib": ["pyyaml", "gym[atari]", "opencv-python", "lz4", "scipy"],
+    "debug": ["psutil", "setproctitle", "py-spy"],
+}
 
 
 class build_ext(_build_ext.build_ext):
@@ -131,6 +134,22 @@ def find_version(*filepath):
         raise RuntimeError("Unable to find version string.")
 
 
+requires = [
+    "numpy",
+    "funcsigs",
+    "click",
+    "colorama",
+    "pytest",
+    "pyyaml",
+    "redis",
+    # The six module is required by pyarrow.
+    "six >= 1.0.0",
+    "flatbuffers",
+]
+
+if sys.version_info < (3, 0):
+    requires.append("faulthandler")
+
 setup(
     name="ray",
     version=find_version("ray", "__init__.py"),
@@ -144,20 +163,7 @@ setup(
     cmdclass={"build_ext": build_ext},
     # The BinaryDistribution argument triggers build_ext.
     distclass=BinaryDistribution,
-    install_requires=[
-        "numpy",
-        "funcsigs",
-        "click",
-        "colorama",
-        "pytest",
-        "pyyaml",
-        "redis~=2.10.6",
-        "faulthandler;python_version<'3'",
-        "setproctitle",
-        # The six module is required by pyarrow.
-        "six >= 1.0.0",
-        "flatbuffers"
-    ],
+    install_requires=requires,
     setup_requires=["cython >= 0.27, < 0.28"],
     extras_require=extras,
     entry_points={

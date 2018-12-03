@@ -331,7 +331,6 @@ class Agent(Trainable):
             self.env_creator = lambda env_config: None
 
         # Merge the supplied config with the class default
-        # FIXME(ev) this is where the bug is, default_config for some reason is not default
         merged_config = copy.deepcopy(self._default_config)
         merged_config = deep_update(merged_config, config,
                                     self._allow_unknown_configs,
@@ -386,13 +385,11 @@ class Agent(Trainable):
             observation, update=False)
         if state:
             return self.local_evaluator.for_policy(
-                lambda p: p.compute_single_action(
-                    filtered_obs, state, is_training=False),
+                lambda p: p.compute_single_action(filtered_obs, state),
                 policy_id=policy_id)
         return self.local_evaluator.for_policy(
-                lambda p: p.compute_single_action(
-                    filtered_obs, state, is_training=False)[0],
-                policy_id=policy_id)
+            lambda p: p.compute_single_action(filtered_obs, state)[0],
+            policy_id=policy_id)
 
     def get_weights(self, policies=None):
         """Return a dictionary of policy ids to weights.
