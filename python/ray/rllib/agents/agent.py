@@ -2,12 +2,13 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import copy
-import os
-import logging
-import pickle
-import tempfile
 from datetime import datetime
+import copy
+import logging
+import os
+import pickle
+import six
+import tempfile
 import tensorflow as tf
 
 import ray
@@ -15,10 +16,13 @@ from ray.rllib.models import MODEL_DEFAULTS
 from ray.rllib.evaluation.policy_evaluator import PolicyEvaluator
 from ray.rllib.optimizers.policy_optimizer import PolicyOptimizer
 from ray.rllib.utils import FilterManager, deep_update, merge_dicts
-from ray.tune.registry import ENV_CREATOR, _global_registry
+from ray.tune.registry import ENV_CREATOR, register_env, _global_registry
 from ray.tune.trainable import Trainable
+from ray.tune.trial import Resources
 from ray.tune.logger import UnifiedLogger
 from ray.tune.result import DEFAULT_RESULTS_DIR
+
+logger = logging.getLogger(__name__)
 
 # yapf: disable
 # __sphinx_doc_begin__
@@ -37,6 +41,7 @@ COMMON_CONFIG = {
         "on_episode_step": None,   # arg: {"env": .., "episode": ...}
         "on_episode_end": None,    # arg: {"env": .., "episode": ...}
         "on_sample_end": None,     # arg: {"samples": .., "evaluator": ...}
+        "on_train_result": None,   # arg: {"agent": ..., "result": ...}
     },
 
     # === Policy ===
@@ -58,14 +63,30 @@ COMMON_CONFIG = {
     # Whether to clip rewards prior to experience postprocessing. Setting to
     # None means clip for Atari only.
     "clip_rewards": None,
+    # Whether to np.clip() actions to the action space low/high range spec.
+    "clip_actions": True,
     # Whether to use rllib or deepmind preprocessors by default
     "preprocessor_pref": "deepmind",
+
+    # === Resources ===
+    # Number of actors used for parallelism
+    "num_workers": 2,
+    # Number of GPUs to allocate to the driver. Note that not all algorithms
+    # can take advantage of driver GPUs. This can be fraction (e.g., 0.3 GPUs).
+    "num_gpus": 0,
+    # Number of CPUs to allocate per worker.
+    "num_cpus_per_worker": 1,
+    # Number of GPUs to allocate per worker. This can be fractional.
+    "num_gpus_per_worker": 0,
+    # Any custom resources to allocate per worker.
+    "custom_resources_per_worker": {},
+    # Number of CPUs to allocate for the driver. Note: this only takes effect
+    # when running in Tune.
+    "num_cpus_for_driver": 1,
 
     # === Execution ===
     # Number of environments to evaluate vectorwise per worker.
     "num_envs_per_worker": 1,
-    # Number of actors used for parallelism
-    "num_workers": 2,
     # Default sample batch size
     "sample_batch_size": 200,
     # Training batch size, if applicable. Should be >= sample_batch_size.
@@ -81,9 +102,9 @@ COMMON_CONFIG = {
     "synchronize_filters": True,
     # Configure TF for single-process operation by default
     "tf_session_args": {
-        # note: parallelism_threads is set to auto for the local evaluator
-        "intra_op_parallelism_threads": 1,
-        "inter_op_parallelism_threads": 1,
+        # note: overriden by `local_evaluator_tf_session_args`
+        "intra_op_parallelism_threads": 2,
+        "inter_op_parallelism_threads": 2,
         "gpu_options": {
             "allow_growth": True,
         },
@@ -93,10 +114,15 @@ COMMON_CONFIG = {
         },
         "allow_soft_placement": True,  # required by PPO multi-gpu
     },
+    # Override the following tf session args on the local evaluator
+    "local_evaluator_tf_session_args": {
+        # Allow a higher level of parallelism by default, but not unlimited
+        # since that can cause crashes with many concurrent drivers.
+        "intra_op_parallelism_threads": 8,
+        "inter_op_parallelism_threads": 8,
+    },
     # Whether to LZ4 compress observations
     "compress_observations": False,
-    # Allocate a fraction of a GPU instead of one (e.g., 0.3 GPUs)
-    "gpu_fraction": 1,
     # Drop metric batches from unresponsive workers after this many seconds
     "collect_metrics_timeout": 180,
 
@@ -125,10 +151,8 @@ def with_common_config(extra_config):
 
 class Agent(Trainable):
     """All RLlib agents extend this base class.
-
     Agent objects retain internal model state between calls to train(), so
     you should create a new agent instance for each training session.
-
     Attributes:
         env_creator (func): Function that creates a new training env.
         config (obj): Algorithm-specific configuration data.
@@ -140,6 +164,17 @@ class Agent(Trainable):
         "tf_session_args", "env_config", "model", "optimizer", "multiagent"
     ]
 
+    @classmethod
+    def default_resource_request(cls, config):
+        cf = dict(cls._default_config, **config)
+        Agent._validate_config(cf)
+        # TODO(ekl): add custom resources here once tune supports them
+        return Resources(
+            cpu=cf["num_cpus_for_driver"],
+            gpu=cf["num_gpus"],
+            extra_cpu=cf["num_cpus_per_worker"] * cf["num_workers"],
+            extra_gpu=cf["num_gpus_per_worker"] * cf["num_workers"])
+
     def make_local_evaluator(self, env_creator, policy_graph):
         """Convenience method to return configured local evaluator."""
 
@@ -148,18 +183,20 @@ class Agent(Trainable):
             env_creator,
             policy_graph,
             0,
-            # important: allow local tf to use multiple CPUs for optimization
-            merge_dicts(
-                self.config, {
-                    "tf_session_args": {
-                        "intra_op_parallelism_threads": None,
-                        "inter_op_parallelism_threads": None,
-                    }
-                }))
+            # important: allow local tf to use more CPUs for optimization
+            merge_dicts(self.config, {
+                "tf_session_args": self.
+                config["local_evaluator_tf_session_args"]
+            }))
 
-    def make_remote_evaluators(self, env_creator, policy_graph, count,
-                               remote_args):
+    def make_remote_evaluators(self, env_creator, policy_graph, count):
         """Convenience method to return a number of remote evaluators."""
+
+        remote_args = {
+            "num_cpus": self.config["num_cpus_per_worker"],
+            "num_gpus": self.config["num_gpus_per_worker"],
+            "resources": self.config["custom_resources_per_worker"],
+        }
 
         cls = PolicyEvaluator.as_remote(**remote_args).remote
         return [
@@ -170,6 +207,8 @@ class Agent(Trainable):
     def _make_evaluator(self, cls, env_creator, policy_graph, worker_index,
                         config):
         def session_creator():
+            logger.debug("Creating TF session {}".format(
+                config["tf_session_args"]))
             return tf.Session(
                 config=tf.ConfigProto(**config["tf_session_args"]))
 
@@ -189,6 +228,7 @@ class Agent(Trainable):
             num_envs=config["num_envs_per_worker"],
             observation_filter=config["observation_filter"],
             clip_rewards=config["clip_rewards"],
+            clip_actions=config["clip_actions"],
             env_config=config["env_config"],
             model_config=config["model"],
             policy_config=config,
@@ -204,9 +244,23 @@ class Agent(Trainable):
                 "DEFAULT_CONFIG defined by each agent for more info.\n\n"
                 "The config of this agent is: {}".format(config))
 
+    @staticmethod
+    def _validate_config(config):
+        if "gpu" in config:
+            raise ValueError(
+                "The `gpu` config is deprecated, please use `num_gpus=0|1` "
+                "instead.")
+        if "gpu_fraction" in config:
+            raise ValueError(
+                "The `gpu_fraction` config is deprecated, please use "
+                "`num_gpus=<fraction>` instead.")
+        if "use_gpu_for_workers" in config:
+            raise ValueError(
+                "The `use_gpu_for_workers` config is deprecated, please use "
+                "`num_gpus_per_worker=1` instead.")
+
     def __init__(self, config=None, env=None, logger_creator=None):
         """Initialize an RLLib agent.
-
         Args:
             config (dict): Algorithm-specific configuration data.
             env (str): Name of the environment to use. Note that this can also
@@ -216,12 +270,13 @@ class Agent(Trainable):
         """
 
         config = config or {}
+        Agent._validate_config(config)
 
         # Vars to synchronize to evaluators on each train call
         self.global_vars = {"timestep": 0}
 
         # Agents allow env ids to be passed directly to the constructor.
-        self._env_id = env or config.get("env")
+        self._env_id = _register_if_needed(env or config.get("env"))
 
         # Create a default logger creator if no logger_creator is specified
         if logger_creator is None:
@@ -252,6 +307,7 @@ class Agent(Trainable):
             self.optimizer.local_evaluator.set_global_vars(self.global_vars)
             for ev in self.optimizer.remote_evaluators:
                 ev.set_global_vars.remote(self.global_vars)
+            logger.debug("updated global vars: {}".format(self.global_vars))
 
         if (self.config.get("observation_filter", "NoFilter") != "NoFilter"
                 and hasattr(self, "local_evaluator")):
@@ -259,8 +315,16 @@ class Agent(Trainable):
                 self.local_evaluator.filters,
                 self.remote_evaluators,
                 update_remote=self.config["synchronize_filters"])
+            logger.debug("synchronized filters: {}".format(
+                self.local_evaluator.filters))
 
-        return Trainable.train(self)
+        result = Trainable.train(self)
+        if self.config["callbacks"].get("on_train_result"):
+            self.config["callbacks"]["on_train_result"]({
+                "agent": self,
+                "result": result,
+            })
+        return result
 
     def _setup(self, config):
         env = self._env_id
@@ -275,7 +339,7 @@ class Agent(Trainable):
             self.env_creator = lambda env_config: None
 
         # Merge the supplied config with the class default
-        merged_config = self._default_config.copy()
+        merged_config = copy.deepcopy(self._default_config)
         merged_config = deep_update(merged_config, config,
                                     self._allow_unknown_configs,
                                     self._allow_unknown_subkeys)
@@ -312,7 +376,6 @@ class Agent(Trainable):
 
     def compute_action(self, observation, state=None, policy_id="default"):
         """Computes an action for the specified policy.
-
         Arguments:
             observation (obj): observation from the environment.
             state (list): RNN hidden state, if any. If state is not None,
@@ -329,17 +392,14 @@ class Agent(Trainable):
             observation, update=False)
         if state:
             return self.local_evaluator.for_policy(
-                lambda p: p.compute_single_action(
-                    filtered_obs, state, is_training=False),
+                lambda p: p.compute_single_action(filtered_obs, state),
                 policy_id=policy_id)
         return self.local_evaluator.for_policy(
-                lambda p: p.compute_single_action(
-                    filtered_obs, state, is_training=False)[0],
-                policy_id=policy_id)
+            lambda p: p.compute_single_action(filtered_obs, state)[0],
+            policy_id=policy_id)
 
     def get_weights(self, policies=None):
         """Return a dictionary of policy ids to weights.
-
         Arguments:
             policies (list): Optional list of policies to return weights for,
                 or None for all policies.
@@ -348,7 +408,6 @@ class Agent(Trainable):
 
     def set_weights(self, weights):
         """Set policy weights by policy id.
-
         Arguments:
             weights (dict): Map of policy ids to weights to set.
         """
@@ -359,6 +418,8 @@ class Agent(Trainable):
         if hasattr(self, "remote_evaluators"):
             for ev in self.remote_evaluators:
                 ev.__ray_terminate__.remote()
+        if hasattr(self, "optimizer"):
+            self.optimizer.stop()
 
     def __getstate__(self):
         state = {}
@@ -380,13 +441,21 @@ class Agent(Trainable):
     def _save(self, checkpoint_dir):
         checkpoint_path = os.path.join(checkpoint_dir,
                                        "checkpoint-{}".format(self.iteration))
-        pickle.dump(self.__getstate__(),
-                    open(checkpoint_path + ".agent_state", "wb"))
+        pickle.dump(self.__getstate__(), open(checkpoint_path, "wb"))
         return checkpoint_path
 
     def _restore(self, checkpoint_path):
-        extra_data = pickle.load(open(checkpoint_path + ".agent_state", "rb"))
+        extra_data = pickle.load(open(checkpoint_path, "rb"))
         self.__setstate__(extra_data)
+
+
+def _register_if_needed(env_object):
+    if isinstance(env_object, six.string_types):
+        return env_object
+    elif isinstance(env_object, type):
+        name = env_object.__name__
+        register_env(name, lambda config: env_object(config))
+        return name
 
 
 def get_agent_class(alg):
@@ -419,9 +488,6 @@ def get_agent_class(alg):
     elif alg == "A2C":
         from ray.rllib.agents import a3c
         return a3c.A2CAgent
-    elif alg == "BC":
-        from ray.rllib.agents import bc
-        return bc.BCAgent
     elif alg == "PG":
         from ray.rllib.agents import pg
         return pg.PGAgent
