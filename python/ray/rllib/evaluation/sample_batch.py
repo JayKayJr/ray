@@ -18,7 +18,6 @@ def to_float_array(v):
 
 class SampleBatchBuilder(object):
     """Util to build a SampleBatch incrementally.
-
     For efficiency, SampleBatches hold values in column form (as arrays).
     However, it is useful to add data one row (dict) at a time.
     """
@@ -54,7 +53,6 @@ class SampleBatchBuilder(object):
 
 class MultiAgentSampleBatchBuilder(object):
     """Util to build SampleBatches for each policy in a multi-agent env.
-
     Input data is per-agent, while output data is per-policy. There is an M:N
     mapping between agents and policies. We retain one local batch builder
     per agent. When an agent is done, then its local batch is appended into the
@@ -63,7 +61,6 @@ class MultiAgentSampleBatchBuilder(object):
 
     def __init__(self, policy_map, clip_rewards):
         """Initialize a MultiAgentSampleBatchBuilder.
-
         Arguments:
             policy_map (dict): Maps policy ids to policy graph instances.
             clip_rewards (bool): Whether to clip rewards before postprocessing.
@@ -86,7 +83,6 @@ class MultiAgentSampleBatchBuilder(object):
 
     def add_values(self, agent_id, policy_id, **values):
         """Add the given dictionary (row) of values to this batch.
-
         Arguments:
             agent_id (obj): Unique id for the agent we are adding values for.
             policy_id (obj): Unique id for policy controlling the agent.
@@ -101,10 +97,8 @@ class MultiAgentSampleBatchBuilder(object):
 
     def postprocess_batch_so_far(self, episode):
         """Apply policy postprocessors to any unprocessed rows.
-
         This pushes the postprocessed per-agent batches onto the per-policy
         builders, clearing per-agent state.
-
         Arguments:
             episode: current MultiAgentEpisode object or None
         """
@@ -142,10 +136,8 @@ class MultiAgentSampleBatchBuilder(object):
 
     def build_and_reset(self, episode):
         """Returns the accumulated sample batches for each policy.
-
         Any unprocessed rows will be first postprocessed with a policy
         postprocessor. The internal state of this builder will be reset.
-
         Arguments:
             episode: current MultiAgentEpisode object or None
         """
@@ -162,7 +154,6 @@ class MultiAgentSampleBatchBuilder(object):
 
 class MultiAgentBatch(object):
     """A batch of experiences from multiple policies in the environment.
-
     Attributes:
         policy_batches (dict): Mapping from policy id to a normal SampleBatch
             of experiences. Note that these batches may be of different length.
@@ -195,6 +186,11 @@ class MultiAgentBatch(object):
             out[policy_id] = SampleBatch.concat_samples(batches)
         return MultiAgentBatch(out, total_count)
 
+    def copy(self):
+        return MultiAgentBatch(
+            {k: v.copy()
+             for (k, v) in self.policy_batches.items()}, self.count)
+
     def total(self):
         ct = 0
         for batch in self.policy_batches.values():
@@ -212,7 +208,6 @@ class MultiAgentBatch(object):
 
 class SampleBatch(object):
     """Wrapper around a dictionary with string keys and array-like values.
-
     For example, {"obs": [1, 2, 3], "reward": [0, -1, 1]} is a batch of three
     samples, each with an "obs" and "reward" attribute.
     """
@@ -242,7 +237,6 @@ class SampleBatch(object):
 
     def concat(self, other):
         """Returns a new SampleBatch with each data column concatenated.
-
         Examples:
             >>> b1 = SampleBatch({"a": [1, 2]})
             >>> b2 = SampleBatch({"a": [3, 4, 5]})
@@ -256,9 +250,13 @@ class SampleBatch(object):
             out[k] = np.concatenate([self[k], other[k]])
         return SampleBatch(out)
 
+    def copy(self):
+        return SampleBatch(
+            {k: np.array(v, copy=True)
+             for (k, v) in self.data.items()})
+
     def rows(self):
         """Returns an iterator over data rows, i.e. dicts with column values.
-
         Examples:
             >>> batch = SampleBatch({"a": [1, 2, 3], "b": [4, 5, 6]})
             >>> for row in batch.rows():
@@ -276,7 +274,6 @@ class SampleBatch(object):
 
     def columns(self, keys):
         """Returns a list of just the specified columns.
-
         Examples:
             >>> batch = SampleBatch({"a": [1], "b": [2], "c": [3]})
             >>> print(batch.columns(["a", "b"]))
