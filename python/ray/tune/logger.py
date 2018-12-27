@@ -12,6 +12,7 @@ import distutils.version
 
 import ray.cloudpickle as cloudpickle
 from ray.tune.log_sync import get_syncer
+from ray.cloudpickle import cloudpickle
 from ray.tune.result import NODE_IP, TRAINING_ITERATION, TIME_TOTAL_S, \
     TIMESTEPS_TOTAL
 
@@ -138,9 +139,11 @@ class _JsonLogger(Logger):
                 indent=2,
                 sort_keys=True,
                 cls=_SafeFallbackEncoder)
-        config_pkl = os.path.join(self.logdir, "params.pkl")
-        with open(config_pkl, "wb") as f:
-            cloudpickle.dump(self.config, f)
+        pkl_out = os.path.join(self.logdir, "params.pkl")
+        with open(config_out, "wb") as f:
+            cloudpickle.dump(
+                        self.config,
+                        f)
         local_file = os.path.join(self.logdir, "result.json")
         self.local_out = open(local_file, "w")
 
