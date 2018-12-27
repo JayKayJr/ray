@@ -38,6 +38,8 @@ public class RunManager {
 
   private List<Process> processes;
 
+  private static final int KILL_PROCESS_WAIT_TIMEOUT_SECONDS = 1;
+
   public RunManager(RayConfig rayConfig) {
     this.rayConfig = rayConfig;
     processes = new ArrayList<>();
@@ -45,8 +47,24 @@ public class RunManager {
   }
 
   public void cleanup() {
-    for (Process p : processes) {
+    // Terminate the processes in the reversed order of creating them.
+    // Because raylet needs to exit before object store, otherwise it
+    // cannot exit gracefully.
+
+    for (int i = processes.size() - 1; i >= 0; --i) {
+      Process p = processes.get(i);
       p.destroy();
+
+      try {
+        p.waitFor(KILL_PROCESS_WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        LOGGER.warn("Got InterruptedException while waiting for process {}" +
+            " to be terminated.",  processes.get(i));
+      }
+
+      if (p.isAlive()) {
+        p.destroyForcibly();
+      }
     }
   }
 
@@ -179,13 +197,16 @@ public class RunManager {
         rayConfig.rayletExecutablePath,
         rayConfig.rayletSocketName,
         rayConfig.objectStoreSocketName,
+        "0",  // The object manager port.
+        "0",  // The node manager port.
         rayConfig.nodeIp,
         rayConfig.getRedisIp(),
         rayConfig.getRedisPort().toString(),
         "0", // number of initial workers
         String.valueOf(maximumStartupConcurrency),
         ResourceUtil.getResourcesStringFromMap(rayConfig.resources),
-        "", // python worker command
+        "",  // The internal config list.
+        buildPythonWorkerCommand(), // python worker command
         buildWorkerCommandRaylet() // java worker command
     );
 
@@ -205,8 +226,8 @@ public class RunManager {
 
     // Generate classpath based on current classpath + user-defined classpath.
     String classpath = concatPath(Stream.concat(
-        Stream.of(System.getProperty("java.class.path").split(":")),
-        rayConfig.classpath.stream()
+        rayConfig.classpath.stream(),
+        Stream.of(System.getProperty("java.class.path").split(":"))
     ));
     cmd.add(classpath);
 
@@ -227,6 +248,8 @@ public class RunManager {
     // Config overwrite
     cmd.add("-Dray.redis.address=" + rayConfig.getRedisAddress());
 
+    cmd.addAll(rayConfig.jvmParameters);
+
     // Main class
     cmd.add(WORKER_CLASS);
     String command = Joiner.on(" ").join(cmd);
@@ -243,6 +266,24 @@ public class RunManager {
         rayConfig.objectStoreSize.toString()
     );
     startProcess(command, null, "plasma_store");
+  }
+
+  private String buildPythonWorkerCommand() {
+    // disable python worker start from raylet, which starts from java
+    if (rayConfig.pythonWorkerCommand == null) {
+      return "";
+    }
+
+    List<String> cmd = new ArrayList<>();
+    cmd.add(rayConfig.pythonWorkerCommand);
+    cmd.add("--node-ip-address=" + rayConfig.nodeIp);
+    cmd.add("--object-store-name=" + rayConfig.objectStoreSocketName);
+    cmd.add("--raylet-name=" + rayConfig.rayletSocketName);
+    cmd.add("--redis-address=" + rayConfig.getRedisAddress());
+
+    String command = cmd.stream().collect(Collectors.joining(" "));
+    LOGGER.debug("python worker command: {}", command);
+    return command;
   }
 
 }
